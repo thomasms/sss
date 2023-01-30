@@ -1,9 +1,34 @@
-from typing import Any, Callable, Dict, Union
-
+from pathlib import Path
+import shutil
+from pickle import dump, load
+from typing import Any, Callable, Dict, Optional, Union
 from functools import wraps
+import atexit
+from uuid import uuid4
+import pandas as pd
 
 
-class SSStore:
+class IStore:
+    """A simple interface to the store"""
+
+    def set(self, key: str, result: Any) -> None:
+        """Add a key value pair"""
+        pass
+
+    def get(self, key: str) -> Union[None, Any]:
+        """Get a value given a key"""
+        return None
+
+    def lazy_get(self, key: str) -> Callable[[], Any]:
+        """Returns a function to retrieve a value"""
+
+        def _get():
+            return self.get(key)
+
+        return _get
+
+
+class StupidlySimpleStore(IStore):
     """A simple static store - Borg pattern"""
 
     __shared_state: Dict[str, Any] = {"_store": {}}
@@ -20,16 +45,63 @@ class SSStore:
         """Get a value given a key"""
         return self._store.get(key, None)
 
-    def lazy_get(self, key: str) -> Callable[[], Any]:
-        """Returns a function to retrieve a value"""
 
-        def _get():
-            return self.get(key)
+class FileStore(IStore):
+    """keep it on disk"""
 
-        return _get
+    def __init__(self, path: Optional[Union[None, Path]] = Path(".")) -> None:
+        """Make a directory for all files in the path"""
+        self.subdir = str(uuid4())
+        self.store_path = path / ".sss" / self.subdir
+        self.store_path.mkdir(parents=True, exist_ok=True)
+        atexit.register(self.cleanup)
+
+    def cleanup(self):
+        shutil.rmtree(self.store_path)
 
 
-def keep(key: str) -> Any:
+class PickleStore(FileStore):
+    """keep it on disk"""
+
+    def _dump(self, key: str, result: Any) -> None:
+        with open(self.store_path / key, "wb") as dfile:
+            dump(result, dfile)
+
+    def _load(self, key: str) -> Any:
+        data = None
+        with open(self.store_path / key, "rb") as dfile:
+            data = load(dfile)
+        return data
+
+    def set(self, key: str, result: Any) -> None:
+        """Add a key value pair"""
+        self._dump(key, result)
+
+    def get(self, key: str) -> Union[None, Any]:
+        """Get a value given a key"""
+        return self._load(key)
+
+
+class FrameStore(FileStore):
+    """Only for dataframes!"""
+
+    def _check_type(self, result: Any) -> None:
+        if not isinstance(result, pd.DataFrame):
+            raise RuntimeError("FrameStore only supports dataframes!")
+
+    def set(self, key: str, result: Any) -> None:
+        """Dump to feather file format"""
+        self._check_type(result)
+        result: pd.DataFrame = result
+        result.to_feather(self.store_path / key)
+
+    def get(self, key: str) -> Union[None, Any]:
+        """Read to feather file format"""
+        # todo: check file exists
+        return pd.read_feather(self.store_path / key)
+
+
+def keep(key: str, store: Optional[IStore] = StupidlySimpleStore()) -> Any:
     """
     Push to in-memory static storage
     """
@@ -38,7 +110,6 @@ def keep(key: str) -> Any:
         @wraps(func)
         def impl(*args, **kwargs) -> Any:
             result = func(*args, **kwargs)
-            store = SSStore()
             store.set(key, result)
             return result
 
@@ -47,17 +118,21 @@ def keep(key: str) -> Any:
     return wrapped
 
 
-def uses(key: str) -> Any:
+def uses(
+    key: str,
+    argname: Optional[Union[None, str]] = None,
+    store: Optional[IStore] = StupidlySimpleStore(),
+) -> Any:
     """
-    Pull from in-memory static storage
+    Pull from storage
     """
 
     def wrapped(func: Callable) -> Any:
         @wraps(func)
         def impl(*args, **kwargs) -> Any:
-            store = SSStore()
             dep = store.get(key)
-            result = func(*args, **{**kwargs, key: dep})
+            nargname = argname if argname is not None else key
+            result = func(*args, **{**kwargs, nargname: dep})
             return result
 
         return impl
@@ -67,24 +142,49 @@ def uses(key: str) -> Any:
 
 ### Example
 
+# instantiate your store(s) somewhere
+# probably in your __init__.py files
+pickle_store = PickleStore()
+simple_store = StupidlySimpleStore()
+frame_store = FrameStore()
 
-@keep("one")
+
+@keep("one", store=simple_store)
 def one(initial=0) -> int:
     return initial
 
 
-@uses("one")
-@keep("two")
-def two(one=0) -> int:
-    return one + 10
+@uses("one", argname="first", store=simple_store)
+@keep("two", store=pickle_store)
+def two(first=0) -> int:
+    return first + 10
 
 
+@uses("one", argname="first", store=simple_store)
+@uses("two", argname="second", store=pickle_store)
+@keep("three", store=simple_store)
+def three(first=0, second=0) -> int:
+    return first + second
+
+
+@keep("four", store=pickle_store)
+def four() -> pd.DataFrame:
+    return pd.DataFrame({"a": [4, 6, 10]})
+
+
+@uses("four", argname="input_df", store=pickle_store)
+@keep("five", store=pickle_store)
+def five(input_df: pd.DataFrame = None) -> pd.DataFrame:
+    df = input_df.copy()
+    df["b"] = df["a"] * 3
+    return df
+
+
+# using ints
 one(3)
 two()
-two()
-one(4)
+print(three())
 
-# -> 4
-print(SSStore().get("one"))
-# -> 3 + 10 = 13
-print(SSStore().get("two"))
+# using dataframes
+four()
+print(five())
