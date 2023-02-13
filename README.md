@@ -3,6 +3,14 @@
 
 Provides two decorates: `keeps` and `uses`, pretty straightforward what they do.
 
+## install
+
+The package is calles `esses` (because there are 3 s's and `sss` was taken).
+
+```bash
+pip install esses
+```
+
 
 ## Examples
 
